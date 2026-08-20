@@ -1,0 +1,16 @@
+{
+  "name": "browser-pong",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Two-player browser Pong with peer-to-peer listen-server hosting. Static site, no runtime dependencies.",
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "start": "python3 -m http.server 8000",
+    "test:e2e": "node test/e2e.mjs"
+  },
+  "devDependencies": {
+    "peer": "^1.0.2",
+    "playwright": "^1.56.0"
+  }
+}
