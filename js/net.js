@@ -1,6 +1,11 @@
 // Peer-to-peer transport. The two browsers talk directly over a WebRTC data
 // channel; the PeerJS broker is used only to introduce them and is out of the
 // loop once the match starts. Nothing here knows any Pong rules.
+//
+// The broker connection is treated as something that WILL drop: phones suspend
+// backgrounded tabs, wifi hands over to cellular, laptops sleep. Losing it is a
+// status, not a failure — the same room ID is reclaimed on reconnect, so a link
+// that has been shared keeps working.
 
 /**
  * Signaling + ICE configuration. The defaults use PeerJS's free public broker
@@ -39,6 +44,11 @@ const CONNECT_TIMEOUT_MS = 20000;
 const HEARTBEAT_MS = 1000;
 const SILENCE_TIMEOUT_MS = 8000;
 
+// Broker errors worth retrying rather than giving up on: all of them mean "the
+// signalling socket went away", which is exactly what a backgrounded tab causes.
+const RECOVERABLE = new Set(['network', 'socket-error', 'socket-closed', 'server-error']);
+const RECONNECT_DELAYS_MS = [400, 900, 2000, 4000, 8000];
+
 export function makeRoomId() {
   const bytes = new Uint8Array(ID_LENGTH);
   crypto.getRandomValues(bytes);
@@ -61,6 +71,7 @@ const ERROR_TEXT = {
     'peer-to-peer traffic — trying from another network usually fixes it.',
   'connection-lost': 'The connection to the other player dropped.',
   full: 'That game already has two players.',
+  'unavailable-id': 'The matchmaking server could not give this browser an ID. Try again.',
 };
 
 export function describeError(code) {
@@ -69,12 +80,14 @@ export function describeError(code) {
 
 /**
  * @param {object} handlers
- *   onReady(roomId)    signaling is up; for a host, the room is joinable
- *   onConnected()      the data channel to the other player is open
- *   onMessage(msg)     a decoded message from the other player
- *   onDisconnected(code) the other player went away
- *   onError(code)      fatal: could not host or join
- *   onRtt(ms)          round-trip time sample
+ *   onReady(roomId, isFirstTime)  signalling is up; for a host, the room is joinable
+ *   onConnected()                 the data channel to the other player is open
+ *   onMessage(msg)                a decoded message from the other player
+ *   onDisconnected(code)          the other player went away
+ *   onError(code)                 fatal: could not host or join
+ *   onRtt(ms)                     round-trip time sample
+ *   onBrokerState(state)          'connecting' | 'live' | 'reconnecting' | 'lost'
+ *   onRoomIdTaken()               the room ID could not be reclaimed on reconnect
  */
 export function createNet(handlers) {
   let peer = null;
@@ -83,12 +96,22 @@ export function createNet(handlers) {
   let roomId = null;
   let connectTimer = null;
   let heartbeatTimer = null;
+  let reconnectTimer = null;
+  let reconnectAttempt = 0;
+  let brokerState = 'connecting';
+  let readyEmitted = false;
   let lastHeard = 0;
   let closed = false;
 
   const emit = (name, ...args) => {
     if (!closed && typeof handlers[name] === 'function') handlers[name](...args);
   };
+
+  function setBrokerState(next) {
+    if (brokerState === next) return;
+    brokerState = next;
+    emit('onBrokerState', next);
+  }
 
   function fail(code) {
     if (closed) return;
@@ -103,31 +126,39 @@ export function createNet(handlers) {
   function stopTimers() {
     clearTimeout(connectTimer);
     clearInterval(heartbeatTimer);
+    clearTimeout(reconnectTimer);
     connectTimer = null;
     heartbeatTimer = null;
+    reconnectTimer = null;
   }
 
-  function startHeartbeat() {
-    lastHeard = Date.now();
-    heartbeatTimer = setInterval(() => {
-      if (!conn || !conn.open) return;
-      if (Date.now() - lastHeard > SILENCE_TIMEOUT_MS) {
-        handleDisconnect('connection-lost');
-        return;
-      }
-      send({ t: MSG.PING, at: Date.now() });
-    }, HEARTBEAT_MS);
+  // --- Keeping the broker connection alive ---------------------------------
+
+  function scheduleReconnect() {
+    if (closed || !peer || peer.destroyed) return;
+    clearTimeout(reconnectTimer);
+    if (reconnectAttempt >= RECONNECT_DELAYS_MS.length) {
+      setBrokerState('lost');
+      return;
+    }
+    setBrokerState('reconnecting');
+    reconnectTimer = setTimeout(attemptReconnect, RECONNECT_DELAYS_MS[reconnectAttempt++]);
   }
 
-  function handleDisconnect(code) {
-    if (closed || !conn) return;
-    const gone = conn;
-    conn = null;
-    stopTimers();
+  function attemptReconnect() {
+    reconnectTimer = null;
+    if (closed || !peer || peer.destroyed) return;
+    if (!peer.disconnected) {
+      setBrokerState('live');
+      return;
+    }
+    setBrokerState('reconnecting');
     try {
-      gone.close();
+      // Reclaims the same ID, so an already-shared link stays valid.
+      peer.reconnect();
     } catch {}
-    emit('onDisconnected', code);
+    // Arm the next attempt as a watchdog; a successful 'open' cancels it.
+    scheduleReconnect();
   }
 
   function attach(connection) {
@@ -158,18 +189,80 @@ export function createNet(handlers) {
     else connection.on('open', onOpen);
   }
 
+  function startHeartbeat() {
+    lastHeard = Date.now();
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = setInterval(() => {
+      if (!conn || !conn.open) return;
+      if (Date.now() - lastHeard > SILENCE_TIMEOUT_MS) {
+        handleDisconnect('connection-lost');
+        return;
+      }
+      send({ t: MSG.PING, at: Date.now() });
+    }, HEARTBEAT_MS);
+  }
+
+  function handleDisconnect(code) {
+    if (closed || !conn) return;
+    const gone = conn;
+    conn = null;
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+    try {
+      gone.close();
+    } catch {}
+    // The peer itself stays registered with the broker, so the other side can
+    // dial back in without anyone having to share a new link.
+    emit('onDisconnected', code);
+  }
+
+  function dial() {
+    attach(peer.connect(ID_PREFIX + roomId, { reliable: true, serialization: 'json' }));
+    clearTimeout(connectTimer);
+    connectTimer = setTimeout(() => {
+      if (!conn || !conn.open) fail('timeout');
+    }, CONNECT_TIMEOUT_MS);
+  }
+
   function createPeer(id) {
     const p = new window.Peer(id, PEER_CONFIG);
+
+    p.on('open', () => {
+      reconnectAttempt = 0;
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+      setBrokerState('live');
+      const first = !readyEmitted;
+      readyEmitted = true;
+      emit('onReady', roomId, first);
+      if (first && role === 'guest') dial();
+    });
+
+    // Fires when the signalling socket closes — the usual outcome of a phone
+    // suspending a backgrounded tab.
+    p.on('disconnected', () => scheduleReconnect());
+
     p.on('error', (err) => {
       const code = err?.type || 'server-error';
+      if (code === 'unavailable-id' && role === 'host' && readyEmitted) {
+        // We were live under this room ID and lost it, so the shared link is
+        // dead and the caller needs to mint a new room.
+        emit('onRoomIdTaken');
+        return;
+      }
       // A dropped data channel surfaces as a peer error too; don't turn a
       // mid-match hiccup into a fatal "couldn't host" screen.
       if (conn && (code === 'network' || code === 'webrtc' || code === 'peer-unavailable')) {
         handleDisconnect('connection-lost');
         return;
       }
+      if (RECOVERABLE.has(code) && !p.destroyed) {
+        scheduleReconnect();
+        return;
+      }
       fail(code);
     });
+
     return p;
   }
 
@@ -183,6 +276,40 @@ export function createNet(handlers) {
     }
   }
 
+  /** Retry the broker connection now, resetting the backoff. */
+  function reconnectNow() {
+    if (closed || !peer || peer.destroyed) return;
+    reconnectAttempt = 0;
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+    attemptReconnect();
+  }
+
+  /**
+   * Re-establish the broker connection without trusting the existing socket.
+   *
+   * A tab that has been suspended often comes back holding a socket that looks
+   * open but is dead at the other end, so the room would silently stop being
+   * joinable. Tearing it down and re-registering is the only way to be sure the
+   * link still works. The peer-to-peer channel is unaffected, so this is safe
+   * mid-match.
+   */
+  function refreshBroker() {
+    if (closed || !peer || peer.destroyed) return;
+    // Still completing the first handshake: interrupting it would abandon the
+    // ID the broker is in the middle of assigning.
+    if (!readyEmitted) return;
+    if (peer.disconnected) {
+      reconnectNow();
+      return;
+    }
+    try {
+      peer.disconnect();
+    } catch {}
+    reconnectAttempt = 0;
+    attemptReconnect();
+  }
+
   return {
     get role() {
       return role;
@@ -193,15 +320,18 @@ export function createNet(handlers) {
     get connected() {
       return !!(conn && conn.open);
     },
+    get brokerState() {
+      return brokerState;
+    },
 
     host() {
       role = 'host';
       roomId = makeRoomId();
       peer = createPeer(ID_PREFIX + roomId);
-      peer.on('open', () => emit('onReady', roomId));
       peer.on('connection', (incoming) => {
-        if (conn) {
-          // Someone else opened the link while a match is in progress.
+        // Only refuse when a live match is already in progress. A dead channel
+        // means the other player is dialling back in after a drop.
+        if (conn && conn.open) {
           incoming.on('open', () => {
             incoming.send({ t: MSG.EVENT, kind: 'full' });
             setTimeout(() => incoming.close(), 250);
@@ -216,16 +346,12 @@ export function createNet(handlers) {
       role = 'guest';
       roomId = id;
       peer = createPeer(undefined);
-      peer.on('open', () => {
-        emit('onReady', id);
-        attach(peer.connect(ID_PREFIX + id, { reliable: true, serialization: 'json' }));
-        connectTimer = setTimeout(() => {
-          if (!conn || !conn.open) fail('timeout');
-        }, CONNECT_TIMEOUT_MS);
-      });
     },
 
     send,
+
+    reconnectNow,
+    refreshBroker,
 
     close() {
       closed = true;

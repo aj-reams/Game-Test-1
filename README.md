@@ -43,6 +43,26 @@ Host browser                                   Guest browser
 Because the host is authoritative there is no state to reconcile between the two machines —
 whatever the host says the ball did is what happened.
 
+### Sharing the link without killing the game
+
+The host's browser being the server has one sharp edge: on a phone, leaving the browser to paste
+the link into a messaging app suspends the tab, which drops the connection to the broker. Three
+things deal with that:
+
+- **Share** uses the native share sheet (`navigator.share`), which opens *over* the page. The
+  browser is never backgrounded, so the room stays registered.
+- **A QR code** in the lobby, for when the other player is in the room with you — nobody has to
+  send anything at all.
+- **If the tab does get suspended anyway**, the game notices the broker connection dropped, says
+  so in the lobby, and reclaims *the same room ID* when you come back. A link you already sent
+  keeps working. The same recovery runs when a laptop wakes or a phone switches network.
+
+A guest whose connection drops mid-match dials back into the same room automatically, and the host
+keeps the match — score and all — waiting for them. What still can't survive is the **host** leaving
+the app in the middle of a match: a suspended tab isn't running the simulation, and nothing in a
+browser can change that. Host from a device you can leave alone, or accept that switching apps ends
+the current point.
+
 ### The one caveat
 
 Pure peer-to-peer WebRTC needs the two networks to let the browsers reach each other. Home
@@ -85,6 +105,7 @@ counts as one).
 | `js/input.js` | Keyboard, mouse and touch → paddle intent |
 | `js/sfx.js` | Synthesised blips, so there are no audio files |
 | `vendor/peerjs.min.js` | Vendored PeerJS 1.5.5 — no CDN at runtime |
+| `vendor/qrcode.js` | Vendored QR generator, imported lazily when the lobby opens |
 
 ## Tests
 
@@ -96,5 +117,10 @@ npm run test:e2e    # two real Chromium pages actually playing each other
 The end-to-end run needs the dev dependencies (`npm install`) and a Chromium
 (`npx playwright install chromium`, or point `CHROMIUM_PATH` at an existing one). It starts a
 local static server and a local PeerJS broker, then drives two browser pages through hosting,
-joining, a rally, a rematch, a turned-away third player and a disconnect — over a real WebRTC
-data channel, with no internet access required.
+joining, a rally, a rematch, a turned-away third player, a disconnect, a guest dialling back into a
+match in progress, and the broker dying and coming back — over a real WebRTC data channel, with no
+internet access required.
+
+That last one is the backgrounded-phone case: the test kills the broker mid-lobby, fires the same
+`visibilitychange` event iOS does when you return to Safari, and checks that the room recovers under
+the same ID and that a link shared *before* the drop still joins the game.

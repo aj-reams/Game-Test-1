@@ -7,6 +7,7 @@
 // broker for signalling, so no internet access is required.
 
 import http from 'node:http';
+import net from 'node:net';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -21,6 +22,7 @@ const SHOTS = path.join(ROOT, 'e2e-artifacts');
 const MIME = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
   '.json': 'application/json',
   '.svg': 'image/svg+xml',
@@ -57,6 +59,62 @@ function serveSite() {
   });
   return new Promise((resolve) => server.listen(SITE_PORT, '127.0.0.1', () => resolve(server)));
 }
+
+/**
+ * The browser always talks to a proxy on one fixed port; the real broker sits
+ * behind it on a port that is never reused. That makes "the broker went away
+ * and a fresh one came back" reproducible, with no waiting for a port to be
+ * released and no chance of binding a port that is still shutting down.
+ */
+function startProxy(port) {
+  let target = null; // null means "refuse everything", i.e. the outage
+  const sockets = new Set();
+  const track = (socket) => {
+    sockets.add(socket);
+    socket.on('close', () => sockets.delete(socket));
+    socket.on('error', () => socket.destroy());
+  };
+
+  const server = net.createServer((client) => {
+    if (!target) {
+      client.destroy();
+      return;
+    }
+    const upstream = net.connect({ host: '127.0.0.1', port: target });
+    track(client);
+    track(upstream);
+    client.pipe(upstream);
+    upstream.pipe(client);
+    upstream.on('close', () => client.destroy());
+  });
+
+  const dropAll = () => {
+    for (const socket of sockets) {
+      try {
+        socket.destroy();
+      } catch {}
+    }
+    sockets.clear();
+  };
+
+  return {
+    listen: () => new Promise((resolve) => server.listen(port, '127.0.0.1', resolve)),
+    pointAt: (upstreamPort) => {
+      target = upstreamPort;
+    },
+    cutOff: () => {
+      target = null;
+      dropAll();
+    },
+    close: () =>
+      new Promise((resolve) => {
+        dropAll();
+        server.close(() => resolve());
+      }),
+  };
+}
+
+const startBroker = (port) => PeerServer({ host: '127.0.0.1', port, path: '/' });
 
 /** Poll until `fn` returns truthy, or throw after `timeout` ms. */
 async function until(label, fn, timeout = 15000, interval = 100) {
@@ -100,7 +158,10 @@ async function newPage(browser, url) {
 async function main() {
   await fs.mkdir(SHOTS, { recursive: true });
   const site = await serveSite();
-  const broker = PeerServer({ host: '127.0.0.1', port: BROKER_PORT, path: '/' });
+  const proxy = startProxy(BROKER_PORT);
+  await proxy.listen();
+  const brokers = [startBroker(BROKER_PORT + 1)];
+  proxy.pointAt(BROKER_PORT + 1);
   const browser = await chromium.launch({
     executablePath: process.env.CHROMIUM_PATH || undefined,
   });
@@ -200,16 +261,108 @@ async function main() {
     check('third player is told the game is full', /two players/.test(await third.textContent('#error-text')));
     await third.close();
 
-    console.log('\nthe host notices the guest leaving');
+    console.log('\nthe guest drops and dials back into the same room');
+    // Score a couple of points so we can tell a resumed match from a fresh one.
+    await host.evaluate(() => {
+      window.__pong.state.score = [3, 2];
+    });
     await guest.close();
     await until('the disconnect overlay', async () => visible(host, 'overlay'), 20000);
     check('host is told the opponent left', /disconnected/i.test(await host.textContent('#overlay-title')));
+    check('host says the link still works', /link still works/i.test(await host.textContent('#overlay-sub')));
     await host.screenshot({ path: path.join(SHOTS, 'host-disconnected.png') });
 
+    const rejoined = await newPage(browser, link);
+    await until('the rejoined guest to be in the game', async () => visible(rejoined, 'screen-game'));
+    check('the original link still works after a drop', await rejoined.evaluate(() => window.__pong.connected));
+    const resumed = (await pongState(host)).score;
+    check(
+      'the match resumes instead of restarting',
+      resumed[0] >= 3 && resumed[1] >= 2,
+      `score is ${resumed}, expected to still be at or past 3,2`,
+    );
+    await rejoined.close();
     await host.close();
+
+    console.log('\nthe lobby survives losing the broker (the backgrounded-phone case)');
+    const solo = await newPage(browser, base);
+    await solo.click('#btn-host');
+    const soloLink = await until('the share link', async () => (await solo.inputValue('#share-link')) || null);
+    const lobbyState = (page) => page.evaluate(() => document.getElementById('lobby-status').className);
+    await until('the room to go live', async () => (await lobbyState(solo)).includes('is-waiting'));
+    // The QR generator is imported lazily, so give it a moment to land.
+    await until('the QR code', async () => solo.evaluate(() => !!document.querySelector('#qr-image svg')));
+    check('the lobby shows a QR code', true);
+
+    // Killing and restarting the broker wipes its registry, so the room only
+    // becomes joinable again if the page actively re-registers itself. A page
+    // may or may not notice the socket dying — a suspended tab often comes back
+    // holding one that looks fine — so the recovery deliberately does not wait
+    // to be told, and neither does this test.
+    proxy.cutOff();
+    const noticed = await Promise.race([
+      until('the lobby to notice', async () => {
+        const state = await lobbyState(solo);
+        return state.includes('is-reconnecting') || state.includes('is-lost');
+      }, 8000).then(() => true),
+      new Promise((r) => setTimeout(() => r(false), 8500)),
+    ]).catch(() => false);
+    console.log(`  ..   the page ${noticed ? 'noticed' : 'did not notice'} the broker dying on its own`);
+
+    // A brand-new broker: its registry is empty, so the room is only joinable
+    // again if the page re-registers itself under the same ID.
+    brokers.push(startBroker(BROKER_PORT + 2));
+    proxy.pointAt(BROKER_PORT + 2);
+    // Exactly what iOS fires when you come back to Safari.
+    await solo.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+    await until('the lobby to come back', async () => (await lobbyState(solo)).includes('is-waiting'), 30000);
+    check('the lobby re-registers itself on return', true);
+    check('the shared link is unchanged', (await solo.inputValue('#share-link')) === soloLink, soloLink);
+
+    const late = await newPage(browser, soloLink);
+    await until('the late guest to join', async () => visible(late, 'screen-game'), 25000);
+    check('the link shared before the drop still joins the game', await late.evaluate(() => window.__pong.connected));
+    await solo.screenshot({ path: path.join(SHOTS, 'lobby-recovered.png') });
+    await late.close();
+    await solo.close();
+
+    console.log('\nthe share sheet is offered when the browser has one');
+    const sharer = await browser.newPage({ viewport: { width: 420, height: 860 } });
+    await sharer.addInitScript(({ port }) => {
+      window.PONG_PEER_CONFIG = {
+        host: '127.0.0.1',
+        port,
+        path: '/',
+        secure: false,
+        key: 'peerjs',
+        debug: 0,
+        config: { iceServers: [] },
+      };
+      window.__shared = [];
+      navigator.share = (data) => {
+        window.__shared.push(data);
+        return Promise.resolve();
+      };
+    }, { port: BROKER_PORT });
+    await sharer.goto(base);
+    await sharer.click('#btn-host');
+    await until('the share button', async () => visible(sharer, 'btn-share'));
+    check('a Share button appears when navigator.share exists', await visible(sharer, 'btn-share'));
+    await sharer.click('#btn-share');
+    const shared = await until('the share payload', async () =>
+      (await sharer.evaluate(() => window.__shared[0])) || null);
+    check('sharing hands over the join link', shared.url === (await sharer.inputValue('#share-link')), shared.url);
+    check('the page is still hosting after sharing', await sharer.evaluate(() => window.__pong.role === 'host'));
+    await sharer.screenshot({ path: path.join(SHOTS, 'lobby-phone.png') });
+    await sharer.close();
   } finally {
     await browser.close();
-    broker.close?.();
+    await proxy.close();
+    for (const b of brokers) {
+      try {
+        b.close?.();
+      } catch {}
+    }
     site.closeAllConnections?.();
     site.close();
   }

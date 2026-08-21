@@ -32,8 +32,19 @@
           <input id="share-link" class="link-input" readonly aria-label="Shareable game link" />
           <button id="btn-copy" class="btn">Copy</button>
         </div>
+        <button id="btn-share" class="btn btn-primary" hidden>Share link&hellip;</button>
         <p id="copy-status" class="status" role="status" aria-live="polite">&nbsp;</p>
-        <p class="dim spinner-line"><span class="spinner" aria-hidden="true"></span> Keep this tab open &mdash; your browser is the server.</p>
+
+        <div id="qr" class="qr" hidden>
+          <div id="qr-image" class="qr-image"></div>
+          <p class="dim qr-caption">&hellip;or point their camera at this.</p>
+        </div>
+
+        <p id="lobby-status" class="lobby-status dim" role="status" aria-live="polite">
+          <span class="spinner" aria-hidden="true"></span>
+          <span id="lobby-status-text">Getting your link ready&hellip;</span>
+        </p>
+        <button id="btn-retry" class="btn" hidden>Reconnect</button>
         <button id="btn-cancel-host" class="btn btn-quiet">Cancel</button>
       </section>
 
