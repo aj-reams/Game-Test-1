@@ -14,6 +14,8 @@ const SNAPSHOT_MS = 33; // ~30 snapshots per second
 const INTERP_DELAY_MS = 90; // guest renders this far behind, to have data to interpolate
 const PREDICTION_SNAP = 26; // px of disagreement before the guest's paddle is corrected
 const ROOM_ID_RE = /^[23456789abcdefghjkmnpqrstuvwxyz]{6}$/;
+const REJOIN_ATTEMPTS = 6; // a guest retries this many times before giving up
+const REJOIN_DELAY_MS = 2500;
 
 const $ = (id) => document.getElementById(id);
 const SCREENS = ['menu', 'lobby', 'connect', 'game', 'error'];
@@ -35,6 +37,10 @@ let guestInput = {}; // host only: most recent input from the guest
 let snapshots = []; // guest only: recent snapshots with local arrival times
 let predicted = null; // guest only: locally predicted own paddle
 let rematchPending = false;
+let currentRoomId = null; // guest: the room to dial back into after a drop
+let rejoinsLeft = 0;
+let rejoinTimer = 0;
+let qrcode = null; // lazily imported; the QR is a convenience, not a dependency
 
 function showScreen(name) {
   for (const s of SCREENS) $(`screen-${s}`).hidden = s !== name;
@@ -52,6 +58,38 @@ function showOverlay(title, sub, { rematch = false } = {}) {
 function hideOverlay() {
   $('overlay').hidden = true;
   rematchPending = false;
+}
+
+const LOBBY_STATUS = {
+  connecting: ['is-connecting', 'Getting your link ready\u2026'],
+  live: ['is-waiting', 'Your link is live. Keep this tab open \u2014 you are the server.'],
+  reconnecting: ['is-reconnecting', 'Reconnecting\u2026 the link won\u2019t work until this finishes.'],
+  lost: ['is-lost', 'Not connected to the matchmaking server.'],
+};
+
+function setLobbyStatus(state) {
+  const [cls, text] = LOBBY_STATUS[state] || LOBBY_STATUS.connecting;
+  const el = $('lobby-status');
+  el.className = `lobby-status dim ${cls}`;
+  $('lobby-status-text').textContent = text;
+  $('btn-retry').hidden = state !== 'lost';
+}
+
+/**
+ * Draw the join link as a QR code so a second device can scan it without
+ * anyone leaving the page. Failure here is silent — the link still works.
+ */
+async function renderQr(link) {
+  try {
+    if (!qrcode) qrcode = (await import('../vendor/qrcode.js')).default;
+    const code = qrcode(0, 'M');
+    code.addData(link);
+    code.make();
+    $('qr-image').innerHTML = code.createSvgTag({ cellSize: 4, margin: 1, scalable: true });
+    $('qr').hidden = false;
+  } catch {
+    $('qr').hidden = true;
+  }
 }
 
 function setHud() {
@@ -76,6 +114,7 @@ function startLoop(frame) {
 /** Tear down everything and return to the menu. */
 function leave() {
   stopLoop();
+  clearTimeout(rejoinTimer);
   net?.close();
   net = null;
   role = null;
@@ -83,6 +122,8 @@ function leave() {
   snapshots = [];
   predicted = null;
   guestInput = {};
+  currentRoomId = null;
+  rejoinsLeft = 0;
   input.reset();
   hideOverlay();
   if (location.hash) history.replaceState(null, '', location.pathname + location.search);
@@ -91,6 +132,7 @@ function leave() {
 
 function fatal(code) {
   stopLoop();
+  clearTimeout(rejoinTimer);
   net?.close();
   net = null;
   $('error-text').textContent = describeError(code);
@@ -106,14 +148,21 @@ function startHost() {
   showScreen('lobby');
   $('copy-status').textContent = ' ';
 
+  setLobbyStatus('connecting');
+
   net = createNet({
-    onReady(roomId) {
+    onReady(roomId, first) {
       const link = `${location.origin}${location.pathname}#${roomId}`;
       $('share-link').value = link;
-      history.replaceState(null, '', `#${roomId}`);
+      $('btn-share').hidden = typeof navigator.share !== 'function';
+      if (first) {
+        history.replaceState(null, '', `#${roomId}`);
+        renderQr(link);
+      }
     },
     onConnected() {
-      sim = Game.createState((Math.random() * 0xffffffff) >>> 0);
+      // Keep the existing match on a reconnect; only a fresh room starts at 0-0.
+      if (!sim) sim = Game.createState((Math.random() * 0xffffffff) >>> 0);
       guestInput = {};
       input.reset();
       hideOverlay();
@@ -125,6 +174,14 @@ function startHost() {
     onDisconnected: onOpponentGone,
     onError: fatal,
     onRtt: showRtt,
+    onBrokerState: setLobbyStatus,
+    onRoomIdTaken() {
+      // Our registration expired while we were away: start a fresh room and
+      // say so, rather than leaving a link that silently goes nowhere.
+      net.close();
+      startHost();
+      $('copy-status').textContent = 'The old link expired — here is a new one.';
+    },
   });
   net.host();
 }
@@ -189,13 +246,18 @@ function startRematch() {
 
 // --- Joining -----------------------------------------------------------
 
-function startJoin(roomId) {
+function startJoin(roomId, { rejoining = false } = {}) {
   role = 'guest';
   youAre = 2;
-  showScreen('connect');
+  currentRoomId = roomId;
+  if (!rejoining) {
+    rejoinsLeft = REJOIN_ATTEMPTS;
+    showScreen('connect');
+  }
 
   net = createNet({
     onConnected() {
+      rejoinsLeft = REJOIN_ATTEMPTS;
       snapshots = [];
       predicted = null;
       input.reset();
@@ -206,10 +268,37 @@ function startJoin(roomId) {
     },
     onMessage: handleGuestMessage,
     onDisconnected: onOpponentGone,
-    onError: fatal,
+    onError: onJoinFailed,
     onRtt: showRtt,
   });
   net.join(roomId);
+}
+
+/**
+ * A guest that has been in the match retries quietly before giving up: a host
+ * whose phone briefly suspended the tab is usually back within seconds.
+ */
+function onJoinFailed(code) {
+  if (rejoinsLeft > 0 && $('screen-game').hidden === false) {
+    scheduleRejoin();
+    return;
+  }
+  fatal(code);
+}
+
+function scheduleRejoin() {
+  if (rejoinsLeft <= 0) {
+    showOverlay('Opponent disconnected', describeError('connection-lost'), { rematch: false });
+    return;
+  }
+  rejoinsLeft--;
+  stopLoop();
+  showOverlay('Reconnecting\u2026', 'Trying to pick the match back up where it left off.', {
+    rematch: false,
+  });
+  net?.close();
+  clearTimeout(rejoinTimer);
+  rejoinTimer = setTimeout(() => startJoin(currentRoomId, { rejoining: true }), REJOIN_DELAY_MS);
 }
 
 function handleGuestMessage(msg) {
@@ -318,12 +407,38 @@ function showWinner(winner) {
 function onOpponentGone(code) {
   stopLoop();
   if (role === 'host' && $('screen-lobby').hidden === false) return; // nobody had joined yet
-  showOverlay('Opponent disconnected', describeError(code), { rematch: false });
+
+  if (role === 'guest') {
+    scheduleRejoin();
+    return;
+  }
+
+  // The host stays registered under the same room ID, so the guest's link still
+  // works and they can dial straight back into the match in progress.
+  showOverlay('Opponent disconnected', 'Their link still works — waiting for them to rejoin.', {
+    rematch: false,
+  });
   showScreen('game');
 }
 
 function showRtt(ms) {
   $('hud-rtt').textContent = `${Math.round(ms)} ms`;
+}
+
+/**
+ * The native share sheet opens as an overlay, so the page keeps running and the
+ * room stays registered — unlike switching to another app to paste a link.
+ */
+async function shareLink() {
+  const link = $('share-link').value;
+  if (!link) return;
+  try {
+    await navigator.share({ title: 'Pong', text: 'Play Pong with me:', url: link });
+    $('copy-status').textContent = ' ';
+  } catch (err) {
+    // A cancelled share sheet is not a failure; anything else falls back to copy.
+    if (err && err.name !== 'AbortError') copyLink();
+  }
 }
 
 async function copyLink() {
@@ -343,6 +458,8 @@ async function copyLink() {
 
 $('btn-host').addEventListener('click', startHost);
 $('btn-copy').addEventListener('click', copyLink);
+$('btn-share').addEventListener('click', shareLink);
+$('btn-retry').addEventListener('click', () => net?.reconnectNow());
 $('share-link').addEventListener('focus', (e) => e.target.select());
 $('btn-cancel-host').addEventListener('click', leave);
 $('btn-cancel-join').addEventListener('click', leave);
@@ -369,6 +486,30 @@ $('btn-mute').addEventListener('click', (e) => {
 
 window.addEventListener('beforeunload', () => net?.close());
 window.addEventListener('resize', () => renderer.resize());
+
+// Phones suspend backgrounded tabs, which drops the broker connection. A tab
+// that was away for more than a moment gets its signalling socket rebuilt from
+// scratch, because a suspended socket can come back looking healthy while the
+// broker has long since forgotten us — and then a link you already sent would
+// quietly go nowhere.
+const SUSPEND_SUSPICION_MS = 3000;
+let hiddenSince = 0;
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    hiddenSince = Date.now();
+    return;
+  }
+  const away = hiddenSince ? Date.now() - hiddenSince : Infinity;
+  hiddenSince = 0;
+  if (away > SUSPEND_SUSPICION_MS) net?.refreshBroker();
+  else net?.reconnectNow();
+});
+window.addEventListener('pageshow', (e) => {
+  // Only a back-forward cache restore; a plain load is already connecting.
+  if (e.persisted) net?.refreshBroker();
+});
+window.addEventListener('online', () => net?.refreshBroker());
 
 // Read-only view of the live match, for the browser console and the
 // end-to-end tests. Nothing in the game reads this back.
